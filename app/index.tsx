@@ -10,6 +10,25 @@ type ExpoNotificationResponse =
 const isExpoGoOnAndroid =
   Platform.OS === "android" && Constants.appOwnership === "expo";
 
+type FirebaseFunctionName = "firestore" | "fcm";
+
+type FunctionCounter = {
+  success: number;
+  failed: number;
+};
+
+type FirebaseStats = Record<FirebaseFunctionName, FunctionCounter>;
+
+type FunctionResult = {
+  success: boolean;
+  message?: string;
+};
+
+const initialFirebaseStats: FirebaseStats = {
+  firestore: { success: 0, failed: 0 },
+  fcm: { success: 0, failed: 0 },
+};
+
 async function getNotificationsModule() {
   if (isExpoGoOnAndroid) {
     return null;
@@ -29,16 +48,103 @@ async function getNotificationsModule() {
   return Notifications;
 }
 
-async function sendPushNotification(expoPushToken: string) {
+function getTotalStats(stats: FirebaseStats) {
+  return Object.values(stats).reduce(
+    (total, current) => ({
+      success: total.success + current.success,
+      failed: total.failed + current.failed,
+    }),
+    { success: 0, failed: 0 },
+  );
+}
+
+function addFunctionResult(
+  stats: FirebaseStats,
+  functionName: FirebaseFunctionName,
+  result: FunctionResult,
+): FirebaseStats {
+  return {
+    ...stats,
+    [functionName]: {
+      success:
+        stats[functionName].success + (result.success ? 1 : 0),
+      failed: stats[functionName].failed + (result.success ? 0 : 1),
+    },
+  };
+}
+
+function buildNotificationBody(stats: FirebaseStats) {
+  const total = getTotalStats(stats);
+
+  return `${total.success} successful, ${total.failed} unsuccessful.`;
+}
+
+async function saveStatsToFirestore(stats: FirebaseStats): Promise<FunctionResult> {
+  const projectId = Constants?.expoConfig?.extra?.firebase?.projectId;
+
+  if (!projectId) {
+    return {
+      success: false,
+      message: "Project ID not found for Firestore.",
+    };
+  }
+
+  try {
+    const total = getTotalStats(stats);
+    const response = await fetch(
+      `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/firebaseStats`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          fields: {
+            firestoreSuccess: { integerValue: stats.firestore.success },
+            firestoreFailed: { integerValue: stats.firestore.failed },
+            fcmSuccess: { integerValue: stats.fcm.success },
+            fcmFailed: { integerValue: stats.fcm.failed },
+            totalSuccess: { integerValue: total.success },
+            totalFailed: { integerValue: total.failed },
+            createdAt: { timestampValue: new Date().toISOString() },
+          },
+        }),
+      },
+    );
+
+    if (!response.ok) {
+      return {
+        success: false,
+        message: `Firestore failed with status ${response.status}.`,
+      };
+    }
+
+    return { success: true };
+  } catch (error: unknown) {
+    return {
+      success: false,
+      message: `${error}`,
+    };
+  }
+}
+
+async function sendPushNotification(
+  expoPushToken: string,
+  stats: FirebaseStats,
+): Promise<FunctionResult> {
   const message = {
     to: expoPushToken,
     sound: "default",
-    title: "Original Title",
-    body: "And here is the body!",
-    data: { someData: "goes here" },
+    title: "Firebase functions: Sent data",
+    body: buildNotificationBody(stats),
+    data: {
+      firestore: stats.firestore,
+      fcm: stats.fcm,
+      total: getTotalStats(stats),
+    },
   };
 
-  await fetch("https://exp.host/--/api/v2/push/send", {
+  const response = await fetch("https://exp.host/--/api/v2/push/send", {
     method: "POST",
     headers: {
       Accept: "application/json",
@@ -47,6 +153,25 @@ async function sendPushNotification(expoPushToken: string) {
     },
     body: JSON.stringify(message),
   });
+
+  if (!response.ok) {
+    return {
+      success: false,
+      message: `FCM failed with status ${response.status}.`,
+    };
+  }
+
+  const result = await response.json();
+  const pushTicket = Array.isArray(result?.data) ? result.data[0] : result?.data;
+
+  if (pushTicket?.status === "error") {
+    return {
+      success: false,
+      message: pushTicket?.message ?? "FCM returned an error ticket.",
+    };
+  }
+
+  return { success: true };
 }
 
 function handleRegistrationError(errorMessage: string) {
@@ -99,6 +224,9 @@ async function registerForPushNotificationsAsync(
 
 export default function App() {
   const [expoPushToken, setExpoPushToken] = useState("");
+  const [firebaseStats, setFirebaseStats] =
+    useState<FirebaseStats>(initialFirebaseStats);
+  const [lastResult, setLastResult] = useState("");
   const [notification, setNotification] = useState<
     ExpoNotification | undefined
   >(undefined);
@@ -162,6 +290,18 @@ export default function App() {
       <Text>Your Expo push token: {expoPushToken}</Text>
       <View style={{ alignItems: "center", justifyContent: "center" }}>
         <Text>
+          Firestore: {firebaseStats.firestore.success} success,{" "}
+          {firebaseStats.firestore.failed} failed
+        </Text>
+        <Text>
+          FCM: {firebaseStats.fcm.success} success, {firebaseStats.fcm.failed}{" "}
+          failed
+        </Text>
+        <Text>Notification body: {buildNotificationBody(firebaseStats)}</Text>
+        <Text>{lastResult}</Text>
+      </View>
+      <View style={{ alignItems: "center", justifyContent: "center" }}>
+        <Text>
           Title: {notification && notification.request.content.title}{" "}
         </Text>
         <Text>Body: {notification && notification.request.content.body}</Text>
@@ -174,7 +314,36 @@ export default function App() {
         title="Press to Send Notification"
         disabled={!expoPushToken.startsWith("ExponentPushToken")}
         onPress={async () => {
-          await sendPushNotification(expoPushToken);
+          const firestoreResult = await saveStatsToFirestore(firebaseStats);
+          const statsAfterFirestore = addFunctionResult(
+            firebaseStats,
+            "firestore",
+            firestoreResult,
+          );
+          const statsForNotification = addFunctionResult(
+            statsAfterFirestore,
+            "fcm",
+            { success: true },
+          );
+          const fcmResult = await sendPushNotification(
+            expoPushToken,
+            statsForNotification,
+          );
+          const nextStats = fcmResult.success
+            ? statsForNotification
+            : addFunctionResult(statsAfterFirestore, "fcm", fcmResult);
+
+          setFirebaseStats(nextStats);
+          setLastResult(
+            [
+              `Firestore: ${firestoreResult.success ? "success" : "failed"}`,
+              `FCM: ${fcmResult.success ? "success" : "failed"}`,
+              firestoreResult.message,
+              fcmResult.message,
+            ]
+              .filter(Boolean)
+              .join(" | "),
+          );
         }}
       />
     </View>

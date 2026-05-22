@@ -12,7 +12,6 @@
       "supportsTablet": true
     },
     "android": {
-      "googleServicesFile": "./google-services.json",
       "package": "com.crossplatform.umn",
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
@@ -46,6 +45,15 @@
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
+    },
+    "extra": {
+      "router": {},
+      "firebase": {
+        "projectId": "week12-b45f3"
+      },
+      "eas": {
+        "projectId": "7b96a0ae-dea0-4c3e-92e6-3b27f2606ec9"
+      }
     }
   }
 }
